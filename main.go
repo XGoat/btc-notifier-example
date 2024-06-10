@@ -8,11 +8,9 @@ import (
 	"os"
 	"time"
 
-	"github.com/btcsuite/btcd/btcutil"
 	"github.com/btcsuite/btcd/chaincfg"
 	"github.com/btcsuite/btcd/chaincfg/chainhash"
 	"github.com/btcsuite/btcd/rpcclient"
-	"github.com/btcsuite/btcd/wire"
 	"github.com/btcsuite/btcwallet/chain"
 	"github.com/lightningnetwork/lnd/blockcache"
 	"github.com/lightningnetwork/lnd/chainntnfs"
@@ -24,38 +22,6 @@ import (
 var startBlock int32 = 1
 var defaultBitcoindBlockCacheSize uint64 = 20 * 1024 * 1024 // 20 MB
 
-func handlerChan(txpool chan<- struct{}, block chan chainhash.Hash) *rpcclient.NotificationHandlers {
-	return &rpcclient.NotificationHandlers{
-		// When a block higher than stopBlock connects to the chain,
-		// send a signal to stop actors. This is used so main can break from
-		// select and call actor.Stop to stop actors.
-		OnBlockConnected: func(hash *chainhash.Hash, h int32, t time.Time) {
-			fmt.Printf("\r%d/%d/%#v", h, startBlock, t)
-			block <- *hash
-		},
-
-		// Send a signal that a tx has been accepted into the mempool. Based on
-		// the tx curve, the receiver will need to wait until required no of tx
-		// are filled up in the mempool
-		OnTxAccepted: func(hash *chainhash.Hash, amount btcutil.Amount) {
-			if txpool != nil {
-				// this will not be blocked because we're creating only
-				// required no of tx and receiving all of them
-				txpool <- struct{}{}
-			}
-		},
-
-		OnFilteredBlockConnected: func(height int32, header *wire.BlockHeader, txns []*btcutil.Tx) {
-			log.Printf("Block connected: %v (%d) %v",
-				header.BlockHash(), height, header.Timestamp)
-		},
-		OnFilteredBlockDisconnected: func(height int32, header *wire.BlockHeader) {
-			log.Printf("Block disconnected: %v (%d) %v",
-				header.BlockHash(), height, header.Timestamp)
-		},
-	}
-}
-
 func BuildDialer(rpcHost string) func(string) (net.Conn, error) {
 	return func(addr string) (net.Conn, error) {
 		return net.Dial("tcp", rpcHost)
@@ -63,21 +29,38 @@ func BuildDialer(rpcHost string) func(string) (net.Conn, error) {
 }
 
 func main() {
-	connCfg2 := &rpcclient.ConnConfig{
+
+	connCfg := &rpcclient.ConnConfig{
 		Host:         os.Args[1],
 		User:         os.Args[2],
 		Pass:         os.Args[3],
 		HTTPPostMode: true, // Bitcoin core only supports HTTP POST mode
 		DisableTLS:   true, // Bitcoin core does not provide TLS by default
 	}
-	txpool := make(chan struct{}, 100)
-	block := make(chan chainhash.Hash, 100)
-	client, err := rpcclient.New(connCfg2, handlerChan(txpool, block))
+	client, err := rpcclient.New(connCfg, nil)
 	if err != nil {
 		log.Fatalf("Init client, %#v ", err.Error())
 	}
 	defer client.Shutdown()
 	log.Printf("Connected")
+
+	/*
+			wcr, err := client.CreateWallet("btcstaker3")
+			if err != nil {
+				log.Fatal(err)
+			}
+			log.Println(wcr)
+
+		wallet, err := client.LoadWallet("btcstaker")
+		if err != nil {
+			log.Printf("Load wallet %#v\n", err)
+		}
+		log.Println(wallet)
+	*/
+
+	if err := client.WalletPassphrase("btcstaker", 30); err != nil {
+		log.Fatalf("load wallet %#v\n", err)
+	}
 
 	boltConfig := kvdb.BoltBackendConfig{
 		DBPath:            "/tmp/btcd-db",
@@ -150,18 +133,20 @@ func main() {
 		log.Fatal(err)
 	}
 
+	if err := chainNotifier.Start(); err != nil {
+		log.Fatalf("start notifier, %#v\n", err)
+	}
+
 	blockHeight, _ := client.GetBlockCount()
 	log.Printf("New notifier at %d\n", blockHeight)
 	ev, err := chainNotifier.RegisterConfirmationsNtfn(
 		txid, txn.MsgTx().TxOut[0].PkScript, 6, uint32(blockHeight),
 	)
 
-	log.Println("Wait for")
-	waitForUnbondingTxConfirmation(ev)
-	log.Println("Wait for shutdown...")
+	waitForTxConfirmation(ev)
 }
 
-func waitForUnbondingTxConfirmation(
+func waitForTxConfirmation(
 	waitEv *chainntnfs.ConfirmationEvent,
 ) {
 	defer waitEv.Cancel()
@@ -170,8 +155,9 @@ func waitForUnbondingTxConfirmation(
 		select {
 		case conf := <-waitEv.Confirmed:
 			log.Printf("conf: %#v\n", conf)
+			return
 		case u := <-waitEv.Updates:
-			log.Printf("Unbonding transaction received confirmation, %#v", u)
+			log.Printf("Received pre-confirmation, %#v", u)
 		}
 	}
 }

@@ -1,4 +1,4 @@
-module btcstaker-notifier
+module btc-notifier-example
 
 go 1.22.1
 
